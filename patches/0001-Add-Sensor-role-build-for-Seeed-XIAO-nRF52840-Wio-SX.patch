@@ -1,0 +1,131 @@
+From 4748842c95ef40a18365ef3133bdf8baa04af371 Mon Sep 17 00:00:00 2001
+From: W2MMD Skunkworks <101467647+w2mmdskunkworks@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 11:56:08 -0400
+Subject: [PATCH] Add Sensor role build for Seeed XIAO nRF52840 + Wio-SX1262
+
+- variants/xiao_nrf52: new Xiao_nrf52_sensor env (simple_sensor, PhillyMesh
+  MeshCore 500 radio defaults, 12 h flood advert) and a personal
+  Xiao_nrf52_sensor_wb2mnf env. Pins toolchain-gccarmnoneeabi 12.3 so it
+  builds on aarch64 hosts with 16K pages (Pi 5).
+- simple_sensor: guest login. A non-empty guest.password now grants
+  read-only access (telemetry + min/max/avg, no CLI); admins are never
+  downgraded. Optional GUEST_PASSWORD / FLOOD_ADVERT_INTERVAL build defaults.
+- EnvironmentSensorManager: TELEM_BMP280_TEMP_ONLY drops pressure/altitude
+  for BMP280 parts whose pressure channel is unreliable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ examples/simple_sensor/SensorMesh.cpp         | 18 ++++++++--
+ .../sensors/EnvironmentSensorManager.cpp      |  2 ++
+ variants/xiao_nrf52/platformio.ini            | 33 +++++++++++++++++++
+ 3 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/examples/simple_sensor/SensorMesh.cpp b/examples/simple_sensor/SensorMesh.cpp
+index 9bfa5ec6..2bd8b193 100644
+--- a/examples/simple_sensor/SensorMesh.cpp
++++ b/examples/simple_sensor/SensorMesh.cpp
+@@ -341,7 +341,10 @@ uint8_t SensorMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t*
+       return 0;
+     }
+   } else {
+-    if (strcmp((char *) data, _prefs.password) != 0) {  // check for valid admin password
++    bool is_admin = strcmp((char *) data, _prefs.password) == 0;  // check for valid admin password
++    bool is_guest = !is_admin && _prefs.guest_password[0] != 0
++                    && strcmp((char *) data, _prefs.guest_password) == 0;  // guest = read-only telemetry
++    if (!is_admin && !is_guest) {
+     #if MESH_DEBUG
+       MESH_DEBUG_PRINTLN("Invalid password: %s", &data[4]);
+     #endif
+@@ -357,7 +360,11 @@ uint8_t SensorMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t*
+     MESH_DEBUG_PRINTLN("Login success!");
+     client->last_timestamp = sender_timestamp;
+     client->last_activity = getRTCClock()->getCurrentTime();
+-    client->permissions |= PERM_ACL_ADMIN;
++    if (is_admin) {
++      client->permissions |= PERM_ACL_ADMIN;
++    } else if (!client->isAdmin()) {  // never downgrade an existing admin
++      client->permissions = (client->permissions & ~PERM_ACL_ROLE_MASK) | PERM_ACL_READ_ONLY;
++    }
+     memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
+ 
+     dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+@@ -718,13 +725,20 @@ SensorMesh::SensorMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millise
+   _prefs.node_lat = ADVERT_LAT;
+   _prefs.node_lon = ADVERT_LON;
+   StrHelper::strncpy(_prefs.password, ADMIN_PASSWORD, sizeof(_prefs.password));
++#ifdef GUEST_PASSWORD
++  StrHelper::strncpy(_prefs.guest_password, GUEST_PASSWORD, sizeof(_prefs.guest_password));
++#endif
+   _prefs.freq = LORA_FREQ;
+   _prefs.sf = LORA_SF;
+   _prefs.bw = LORA_BW;
+   _prefs.cr = LORA_CR;
+   _prefs.tx_power_dbm = LORA_TX_POWER;
+   _prefs.advert_interval = 1;  // default to 2 minutes for NEW installs
++#ifdef FLOOD_ADVERT_INTERVAL
++  _prefs.flood_advert_interval = FLOOD_ADVERT_INTERVAL;   // hours
++#else
+   _prefs.flood_advert_interval = 0;   // disabled
++#endif
+   _prefs.disable_fwd = true;
+   _prefs.flood_max = 64;
+   _prefs.interference_threshold = 0;  // disabled
+diff --git a/src/helpers/sensors/EnvironmentSensorManager.cpp b/src/helpers/sensors/EnvironmentSensorManager.cpp
+index e2f0d33e..7f625b3a 100644
+--- a/src/helpers/sensors/EnvironmentSensorManager.cpp
++++ b/src/helpers/sensors/EnvironmentSensorManager.cpp
+@@ -296,8 +296,10 @@ static uint8_t init_bmp280(TwoWire*, uint8_t addr) {
+ }
+ static void query_bmp280(uint8_t ch, uint8_t, CayenneLPP& lpp) {
+   lpp.addTemperature(ch, BMP280.readTemperature());
++#ifndef TELEM_BMP280_TEMP_ONLY  // set when the pressure channel can't be trusted (e.g. clone chips)
+   lpp.addBarometricPressure(ch, BMP280.readPressure() / 100);
+   lpp.addAltitude(ch, BMP280.readAltitude(TELEM_BMP280_SEALEVELPRESSURE_HPA));
++#endif
+ }
+ #endif
+ 
+diff --git a/variants/xiao_nrf52/platformio.ini b/variants/xiao_nrf52/platformio.ini
+index 1076bd8d..84b28e39 100644
+--- a/variants/xiao_nrf52/platformio.ini
++++ b/variants/xiao_nrf52/platformio.ini
+@@ -119,3 +119,36 @@ build_src_filter = ${Xiao_nrf52.build_src_filter}
+   +<../examples/kiss_modem/*.cpp>
+ lib_deps =
+   ${Xiao_nrf52.lib_deps}
++
++; Sensor role (temperature/pressure/humidity etc. via auto-detected I2C sensors on SDA=D7 / SCL=D6).
++; Radio defaults to the PhillyMesh "MeshCore 500" profile (919.5 MHz / 500 kHz / SF10 / CR5).
++[env:Xiao_nrf52_sensor]
++extends = Xiao_nrf52
++; aarch64 hosts with 16K pages (Pi 5): the platform's default (<1.8) toolchain has no aarch64
++; build and gcc 9.3 segfaults, so pin 12.3 (also fine on x86_64)
++platform_packages = platformio/toolchain-gccarmnoneeabi@1.120301.0
++build_flags =
++  ${Xiao_nrf52.build_flags}
++  -D ADVERT_NAME='"XIAO Sensor"'
++  -D ADVERT_LAT=0.0
++  -D ADVERT_LON=0.0
++  -D ADMIN_PASSWORD='"password"'
++  -D FLOOD_ADVERT_INTERVAL=12
++  -D LORA_FREQ=919.5
++  -D LORA_BW=500
++  -D LORA_SF=10
++  -D LORA_CR=5
++;  -D MESH_PACKET_LOGGING=1
++;  -D MESH_DEBUG=1
++build_src_filter = ${Xiao_nrf52.build_src_filter}
++  +<../examples/simple_sensor>
++
++; WB2MNF's QTH node: purple GY BMP280 reads pressure x0.766 low (suspect clone), so send temperature only
++[env:Xiao_nrf52_sensor_wb2mnf]
++extends = env:Xiao_nrf52_sensor
++build_flags =
++  ${env:Xiao_nrf52_sensor.build_flags}
++  -UADVERT_NAME
++  -D ADVERT_NAME='"WB2MNF QTH Temp"'
++  -D GUEST_PASSWORD='"MNFguest"'
++  -D TELEM_BMP280_TEMP_ONLY=1
+-- 
+2.47.3
+
